@@ -1,25 +1,52 @@
 // backend/src/controllers/emailController.ts
 import { Request, Response } from "express";
 import crypto from "crypto";
+import { Resend } from "resend";
 import { pool } from "../config/database";
 import { AuthRequest } from "../middleware/auth";
 
-// Mocka e-post (loggar till konsolen)
+// Hämta miljövariabler
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM = process.env.EMAIL_FROM || "noreply@poolbeferest.com";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+// Initiera Resend-klient endast i produktion (eller om nyckel finns)
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
 async function sendEmail(
   to: string,
   subject: string,
   html: string,
 ): Promise<void> {
-  console.log(`
+  // Mock-läge: om vi inte är i produktion ELLER om Resend inte är initierat (ingen nyckel)
+  if (!IS_PRODUCTION || !resend) {
+    console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║ 📧 MOCK EMAIL                                            ║
+║ 📧 MOCK EMAIL (utvecklingsläge)                          ║
 ╠══════════════════════════════════════════════════════════╣
 ║ To:      ${to}
 ║ Subject: ${subject}
 ╠══════════════════════════════════════════════════════════╣
 ║ HTML: ${html}
 ╚══════════════════════════════════════════════════════════╝
-  `);
+    `);
+    return;
+  }
+
+  // Produktionsläge – skicka riktigt mejl via Resend
+  try {
+    const { data, error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [to],
+      subject,
+      html,
+    });
+    if (error) throw new Error(error.message);
+    console.log(`✅ Email sent to ${to} – ID: ${data?.id}`);
+  } catch (err) {
+    console.error("Resend error:", err);
+    throw new Error("Email delivery failed");
+  }
 }
 
 // Begär e-poständring
@@ -28,16 +55,14 @@ export const requestEmailChange = async (
   res: Response,
 ): Promise<Response> => {
   const userId = req.user?.id;
-  if (!userId) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
   const { newEmail } = req.body;
   if (!newEmail || typeof newEmail !== "string") {
     return res.status(400).json({ error: "New email is required" });
   }
 
-  // Kontrollera att den nya e-posten inte redan används
+  // Kontrollera att e-posten inte redan används
   const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
     newEmail,
   ]);
@@ -59,7 +84,7 @@ export const requestEmailChange = async (
     [userId, token],
   );
 
-  // Bygg verifieringslänk – direkt till backend-API:et (inte frontend)
+  // Bygg verifieringslänk – direkt till backend-API:et (som omdirigerar till frontend)
   const backendUrl = process.env.BACKEND_URL || "http://localhost:4000";
   const verifyLink = `${backendUrl}/api/auth/verify-email?token=${token}`;
   const html = `<p>Klicka på länken för att verifiera din nya e-postadress: <a href="${verifyLink}">${verifyLink}</a></p>`;
@@ -83,7 +108,6 @@ export const verifyEmail = async (
   }
 
   try {
-    // Hitta token i databasen
     const tokenResult = await pool.query(
       `SELECT user_id FROM email_verification_tokens WHERE token = $1 AND expires_at > NOW()`,
       [token],
@@ -94,14 +118,11 @@ export const verifyEmail = async (
     }
 
     const userId = tokenResult.rows[0].user_id;
-
-    // Hämta den väntande e-postadressen
     const pendingRes = await pool.query(
       "SELECT pending_email FROM users WHERE id = $1",
       [userId],
     );
     const newEmail = pendingRes.rows[0]?.pending_email;
-
     if (!newEmail) {
       res.status(400).json({ error: "No pending email change" });
       return;
@@ -112,14 +133,11 @@ export const verifyEmail = async (
       "UPDATE users SET email = $1, pending_email = NULL WHERE id = $2",
       [newEmail, userId],
     );
-
-    // Rensa användarens verifieringstokens
     await pool.query(
       "DELETE FROM email_verification_tokens WHERE user_id = $1",
       [userId],
     );
 
-    // Omdirigera till frontend-inställningarna med framgångsparameter
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
     res.redirect(`${frontendUrl}/settings?emailVerified=true`);
   } catch (error) {
